@@ -20,7 +20,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Instant, Duration},
 };
 
 struct AudioPlayer {
@@ -28,6 +28,36 @@ struct AudioPlayer {
     duration: Duration,
     progress: Arc<Mutex<Duration>>,
     eq_enabled: Arc<AtomicBool>,
+    is_playing: Arc<AtomicBool>,
+    last_update: Arc<Mutex<Instant>>,
+}
+
+impl AudioPlayer {
+    fn get_playback_position(&self) -> Duration {
+        let mut progress = self.progress.lock().unwrap();
+        let mut last_update = self.last_update.lock().unwrap();
+        
+        if self.is_playing.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            let elapsed = now.duration_since(*last_update);
+            *progress += elapsed;
+            *last_update = now;
+        }
+        
+        *progress
+    }
+
+    fn play(&self) {
+        self.sink.lock().unwrap().play();
+        self.is_playing.store(true, Ordering::Relaxed);
+        *self.last_update.lock().unwrap() = Instant::now();
+    }
+
+    fn pause(&self) {
+        self.sink.lock().unwrap().pause();
+        self.is_playing.store(false, Ordering::Relaxed);
+        self.get_playback_position(); // Update progress before pausing
+    }
 }
 
 struct Equalizer<S>
@@ -170,9 +200,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         duration,
         progress: Arc::new(Mutex::new(Duration::from_secs(0))),
         eq_enabled: Arc::new(AtomicBool::new(true)),
+        is_playing: Arc::new(AtomicBool::new(false)),
+        last_update: Arc::new(Mutex::new(Instant::now())),
     };
 
-    let res = run_app(&mut terminal, audio_player);
+    let res = run_app(&mut terminal, &audio_player);
 
     disable_raw_mode()?;
     execute!(
@@ -191,50 +223,37 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    mut audio_player: AudioPlayer,
+    audio_player: &AudioPlayer,
 ) -> Result<(), Box<dyn Error>> {
     loop {
-        terminal.draw(|f| ui(f, &audio_player))?;
+        terminal.draw(|f| ui(f, audio_player))?;
 
         if event::poll(Duration::from_millis(10))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') => return Ok(()),
                     KeyCode::Char(' ') => {
-                        let sink = audio_player.sink.lock().unwrap();
-                        if sink.is_paused() {
-                            sink.play();
+                        if audio_player.is_playing.load(Ordering::Relaxed) {
+                            audio_player.pause();
                         } else {
-                            sink.pause();
+                            audio_player.play();
                         }
                     }
                     KeyCode::Char('e') => {
-                        let current_pos = *audio_player.progress.lock().unwrap();
-                        seek(&mut audio_player, current_pos, true);
+                        let current_pos = audio_player.get_playback_position();
+                        seek(audio_player, current_pos, true);
                     }
                     KeyCode::Left => {
-                        let current_pos = *audio_player.progress.lock().unwrap();
+                        let current_pos = audio_player.get_playback_position();
                         let new_pos = current_pos.saturating_sub(Duration::from_secs(5));
-                        seek(&mut audio_player, new_pos, false);
+                        seek(audio_player, new_pos, false);
                     }
                     KeyCode::Right => {
-                        let current_pos = *audio_player.progress.lock().unwrap();
-                        let new_pos =
-                            (current_pos + Duration::from_secs(5)).min(audio_player.duration);
-                        seek(&mut audio_player, new_pos, false);
+                        let current_pos = audio_player.get_playback_position();
+                        let new_pos = (current_pos + Duration::from_secs(5)).min(audio_player.duration);
+                        seek(audio_player, new_pos, false);
                     }
                     _ => {}
-                }
-            }
-        }
-
-        {
-            let sink = audio_player.sink.lock().unwrap();
-            if !sink.is_paused() {
-                let mut progress = audio_player.progress.lock().unwrap();
-                *progress += Duration::from_millis(10);
-                if *progress > audio_player.duration {
-                    *progress = audio_player.duration;
                 }
             }
         }
@@ -258,7 +277,7 @@ fn ui(f: &mut ratatui::Frame, audio_player: &AudioPlayer) {
         )
         .split(f.area());
 
-    let progress = *audio_player.progress.lock().unwrap();
+    let progress = audio_player.get_playback_position();
     let duration = audio_player.duration;
 
     let current_secs = progress.as_secs();
@@ -306,26 +325,23 @@ fn ui(f: &mut ratatui::Frame, audio_player: &AudioPlayer) {
     f.render_widget(eq_status_widget, chunks[2]);
 }
 
-fn seek(audio_player: &mut AudioPlayer, position: Duration, toggle_eq: bool) {
-    let sink = &mut audio_player.sink.lock().unwrap();
-    let was_playing = !sink.is_paused();
+fn seek(audio_player: &AudioPlayer, position: Duration, toggle_eq: bool) {
+    let sink = audio_player.sink.lock().unwrap();
+    let was_playing = audio_player.is_playing.load(Ordering::Relaxed);
 
-    if !toggle_eq {
-        sink.stop();
-    }
+    sink.stop();
+    audio_player.is_playing.store(false, Ordering::Relaxed);
 
     let file = BufReader::new(File::open("outaspace.flac").expect("Failed to open file"));
     let decoder = Decoder::new(file)
         .expect("Failed to create decoder")
         .convert_samples::<f32>();
 
-    let db_gains = vec![4.6, 8.0, 4.6, 0.9, 0.0, 3.0, 0.9, 0.0, 0.0, 0.0];
+    let db_gains = vec![6.0, 3.0, 0.0, 0.0, -3.0, -6.0, 0.0, 3.0, 6.0, 3.0];
 
     if toggle_eq {
         let current_state = audio_player.eq_enabled.load(Ordering::Relaxed);
-        audio_player
-            .eq_enabled
-            .store(!current_state, Ordering::Relaxed);
+        audio_player.eq_enabled.store(!current_state, Ordering::Relaxed);
     }
 
     let source = if audio_player.eq_enabled.load(Ordering::Relaxed) {
@@ -334,11 +350,12 @@ fn seek(audio_player: &mut AudioPlayer, position: Duration, toggle_eq: bool) {
         Box::new(decoder) as Box<dyn Source<Item = f32> + Send>
     };
 
-    sink.clear();
     sink.append(source.skip_duration(position));
     *audio_player.progress.lock().unwrap() = position;
+    *audio_player.last_update.lock().unwrap() = Instant::now();
 
     if was_playing {
         sink.play();
+        audio_player.is_playing.store(true, Ordering::Relaxed);
     }
 }
