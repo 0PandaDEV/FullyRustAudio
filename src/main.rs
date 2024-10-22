@@ -13,6 +13,7 @@ use ratatui::{
 use rodio::{Decoder, OutputStream, Sink, Source};
 use std::{
     error::Error,
+    f32::consts::PI,
     fs::File,
     io::BufReader,
     sync::{
@@ -34,8 +35,57 @@ where
     S: Source<Item = f32>,
 {
     source: S,
-    gains: Vec<f32>,
-    sample_rate: u32,
+    filters: Vec<BiquadFilter>,
+}
+
+struct BiquadFilter {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+impl BiquadFilter {
+    fn new(frequency: f32, q: f32, gain: f32, sample_rate: u32) -> Self {
+        let omega = 2.0 * PI * frequency / sample_rate as f32;
+        let alpha = omega.sin() / (2.0 * q);
+        let a = 10.0f32.powf(gain / 40.0);
+
+        let b0 = 1.0 + alpha * a;
+        let b1 = -2.0 * omega.cos();
+        let b2 = 1.0 - alpha * a;
+        let a0 = 1.0 + alpha / a;
+        let a1 = -2.0 * omega.cos();
+        let a2 = 1.0 - alpha / a;
+
+        BiquadFilter {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    fn process(&mut self, input: f32) -> f32 {
+        let output = self.b0 * input + self.b1 * self.x1 + self.b2 * self.x2
+            - self.a1 * self.y1
+            - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = input;
+        self.y2 = self.y1;
+        self.y1 = output;
+        output
+    }
 }
 
 impl<S> Equalizer<S>
@@ -44,11 +94,16 @@ where
 {
     fn new(source: S, gains: Vec<f32>) -> Self {
         let sample_rate = source.sample_rate();
-        Equalizer {
-            source,
-            gains,
-            sample_rate,
-        }
+        let frequencies = [
+            32.0, 64.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+        ];
+        let filters = frequencies
+            .iter()
+            .zip(gains.iter())
+            .map(|(&freq, &gain)| BiquadFilter::new(freq, 1.41, gain, sample_rate))
+            .collect();
+
+        Equalizer { source, filters }
     }
 }
 
@@ -59,25 +114,10 @@ where
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.source.next().map(|mut sample| {
-            for &gain in &self.gains {
-                let frequency = 32.0 * 2.0f32.powi(0);
-                let omega = 2.0 * std::f32::consts::PI * frequency / self.sample_rate as f32;
-                let alpha = omega.sin() / (2.0 * 0.5);
-
-                let a0 = 1.0 + alpha;
-                let a1 = -2.0 * omega.cos();
-                let a2 = 1.0 - alpha;
-                let b0 = 1.0 + alpha * gain;
-                let b1 = -2.0 * omega.cos();
-                let b2 = 1.0 - alpha * gain;
-
-                sample = (b0 / a0) * sample + (b1 / a0) * 0.0 + (b2 / a0) * 0.0
-                    - (a1 / a0) * 0.0
-                    - (a2 / a0) * 0.0;
-            }
-
-            sample
+        self.source.next().map(|sample| {
+            self.filters
+                .iter_mut()
+                .fold(sample, |s, filter| filter.process(s))
         })
     }
 }
@@ -121,11 +161,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .convert_samples::<f32>();
     let duration = decoder.total_duration().unwrap_or(Duration::from_secs(0));
 
-    let db_gains = vec![12.0, 12.0, 4.6, 0.9, 0.0, 3.0, 0.9, 0.0, 0.0, 0.0];
-
-    let gains: Vec<f32> = db_gains.iter().map(|&db| 10f32.powf(db / 20.0)).collect();
-
-    let equalizer = Equalizer::new(decoder, gains);
+    let db_gains = vec![4.6, 8.0, 4.6, 0.9, 0.0, 3.0, 0.9, 0.0, 0.0, 0.0];
+    let equalizer = Equalizer::new(decoder, db_gains);
     sink.lock().unwrap().append(equalizer);
 
     let audio_player = AudioPlayer {
@@ -172,10 +209,6 @@ fn run_app(
                         }
                     }
                     KeyCode::Char('e') => {
-                        let current_state = audio_player.eq_enabled.load(Ordering::Relaxed);
-                        audio_player
-                            .eq_enabled
-                            .store(!current_state, Ordering::Relaxed);
                         let current_pos = *audio_player.progress.lock().unwrap();
                         seek(&mut audio_player, current_pos, true);
                     }
@@ -186,7 +219,8 @@ fn run_app(
                     }
                     KeyCode::Right => {
                         let current_pos = *audio_player.progress.lock().unwrap();
-                        let new_pos = (current_pos + Duration::from_secs(5)).min(audio_player.duration);
+                        let new_pos =
+                            (current_pos + Duration::from_secs(5)).min(audio_player.duration);
                         seek(&mut audio_player, new_pos, false);
                     }
                     _ => {}
@@ -274,25 +308,37 @@ fn ui(f: &mut ratatui::Frame, audio_player: &AudioPlayer) {
 
 fn seek(audio_player: &mut AudioPlayer, position: Duration, toggle_eq: bool) {
     let sink = &mut audio_player.sink.lock().unwrap();
+    let was_playing = !sink.is_paused();
+
     if !toggle_eq {
         sink.stop();
     }
+
     let file = BufReader::new(File::open("outaspace.flac").expect("Failed to open file"));
     let decoder = Decoder::new(file)
         .expect("Failed to create decoder")
         .convert_samples::<f32>();
-    let gains = vec![12.0, 12.0, 4.6, 0.9, 0.0, 3.0, 0.9, 0.0, 0.0, 0.0];
-    let linear_gains: Vec<f32> = gains.iter().map(|&db| 10f32.powf(db / 20.0)).collect();
+
+    let db_gains = vec![4.6, 8.0, 4.6, 0.9, 0.0, 3.0, 0.9, 0.0, 0.0, 0.0];
+
+    if toggle_eq {
+        let current_state = audio_player.eq_enabled.load(Ordering::Relaxed);
+        audio_player
+            .eq_enabled
+            .store(!current_state, Ordering::Relaxed);
+    }
 
     let source = if audio_player.eq_enabled.load(Ordering::Relaxed) {
-        Box::new(Equalizer::new(decoder, linear_gains)) as Box<dyn Source<Item = f32> + Send>
+        Box::new(Equalizer::new(decoder, db_gains)) as Box<dyn Source<Item = f32> + Send>
     } else {
         Box::new(decoder) as Box<dyn Source<Item = f32> + Send>
     };
 
-    if toggle_eq {
-        sink.clear();
-    }
+    sink.clear();
     sink.append(source.skip_duration(position));
     *audio_player.progress.lock().unwrap() = position;
+
+    if was_playing {
+        sink.play();
+    }
 }
