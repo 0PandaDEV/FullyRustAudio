@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .convert_samples::<f32>();
     let duration = decoder.total_duration().unwrap_or(Duration::from_secs(0));
 
-    let db_gains = vec![4.6, 8.0, 4.6, 0.9, 0.0, 3.0, 0.9, 0.0, 0.0, 0.0];
+    let db_gains = vec![12.0, 12.0, 4.6, 0.9, 0.0, 3.0, 0.9, 0.0, 0.0, 0.0];
 
     let gains: Vec<f32> = db_gains.iter().map(|&db| 10f32.powf(db / 20.0)).collect();
 
@@ -177,18 +177,17 @@ fn run_app(
                             .eq_enabled
                             .store(!current_state, Ordering::Relaxed);
                         let current_pos = *audio_player.progress.lock().unwrap();
-                        seek(&mut audio_player, current_pos);
+                        seek(&mut audio_player, current_pos, true);
                     }
                     KeyCode::Left => {
                         let current_pos = *audio_player.progress.lock().unwrap();
                         let new_pos = current_pos.saturating_sub(Duration::from_secs(5));
-                        seek(&mut audio_player, new_pos);
+                        seek(&mut audio_player, new_pos, false);
                     }
                     KeyCode::Right => {
                         let current_pos = *audio_player.progress.lock().unwrap();
-                        let new_pos =
-                            (current_pos + Duration::from_secs(5)).min(audio_player.duration);
-                        seek(&mut audio_player, new_pos);
+                        let new_pos = (current_pos + Duration::from_secs(5)).min(audio_player.duration);
+                        seek(&mut audio_player, new_pos, false);
                     }
                     _ => {}
                 }
@@ -273,14 +272,16 @@ fn ui(f: &mut ratatui::Frame, audio_player: &AudioPlayer) {
     f.render_widget(eq_status_widget, chunks[2]);
 }
 
-fn seek(audio_player: &mut AudioPlayer, position: Duration) {
+fn seek(audio_player: &mut AudioPlayer, position: Duration, toggle_eq: bool) {
     let sink = &mut audio_player.sink.lock().unwrap();
-    sink.stop();
+    if !toggle_eq {
+        sink.stop();
+    }
     let file = BufReader::new(File::open("outaspace.flac").expect("Failed to open file"));
     let decoder = Decoder::new(file)
         .expect("Failed to create decoder")
         .convert_samples::<f32>();
-    let gains = vec![4.6, 8.0, 4.6, 0.9, 0.0, 3.0, 0.9, 0.0, 0.0, 0.0];
+    let gains = vec![12.0, 12.0, 4.6, 0.9, 0.0, 3.0, 0.9, 0.0, 0.0, 0.0];
     let linear_gains: Vec<f32> = gains.iter().map(|&db| 10f32.powf(db / 20.0)).collect();
 
     let source = if audio_player.eq_enabled.load(Ordering::Relaxed) {
@@ -289,6 +290,9 @@ fn seek(audio_player: &mut AudioPlayer, position: Duration) {
         Box::new(decoder) as Box<dyn Source<Item = f32> + Send>
     };
 
-    sink.append(source);
+    if toggle_eq {
+        sink.clear();
+    }
+    sink.append(source.skip_duration(position));
     *audio_player.progress.lock().unwrap() = position;
 }
